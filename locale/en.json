@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "JSON tools",
+    "description": "Format or minify JSON text with 2/4-space indents, line and column error locations, and one-click copy."
+  }
+}

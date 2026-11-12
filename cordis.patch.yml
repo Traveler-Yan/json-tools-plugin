@@ -1,0 +1,3 @@
+- insert:
+    - id: json-tools
+      name: '@local/json-tools'
