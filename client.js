@@ -48,11 +48,214 @@ window.__ModuleLoader__.load({
       const percent = Math.round((Math.abs(to - from) / from) * 100);
       return to >= from ? percent : -percent;
     }
+
+    const FIX_LABELS = {
+      trailingComma: 'issueTrailingComma',
+      singleQuote: 'issueSingleQuote',
+      smartQuote: 'issueSmartQuote',
+      comment: 'issueComment',
+      unquotedKey: 'issueUnquotedKey',
+      literal: 'issueLiteral',
+      fullWidth: 'issueFullWidth',
+      bom: 'issueBom',
+    };
+
+    const FIX_ORDER = ['trailingComma', 'singleQuote', 'smartQuote', 'comment', 'unquotedKey', 'literal', 'fullWidth', 'bom'];
+
+    const FULL_WIDTH_CHARS = {
+      '\uff0c': ',',
+      '\uff1a': ':',
+      '\uff5b': '{',
+      '\uff5d': '}',
+      '\uff3b': '[',
+      '\uff3d': ']',
+      '\uff02': '"',
+    };
+
+    function isWordStart(code) {
+      return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95 || code === 36;
+    }
+
+    function isWordPart(code) {
+      return isWordStart(code) || (code >= 48 && code <= 57);
+    }
+
+    function isSpacing(char) {
+      return char === ' ' || char === '\n' || char === '\r' || char === '\t';
+    }
+
+    /** Rewrites near-JSON into strict JSON, counting each repair category. */
+    function scanJsonish(source, bump) {
+      let out = '';
+      let index = 0;
+      const length = source.length;
+
+      const closeBracket = (bracket) => {
+        let cursor = out.length - 1;
+        while (cursor >= 0 && isSpacing(out[cursor])) cursor -= 1;
+        if (cursor >= 0 && out[cursor] === ',') {
+          out = out.slice(0, cursor) + out.slice(cursor + 1);
+          bump('trailingComma');
+        }
+        out += bracket;
+      };
+
+      while (index < length) {
+        const ch = source[index];
+
+        if (ch === '}' || ch === ']') {
+          closeBracket(ch);
+          index += 1;
+          continue;
+        }
+
+        if (ch === '/' && source[index + 1] === '/') {
+          index += 2;
+          while (index < length && source[index] !== '\n') index += 1;
+          bump('comment');
+          continue;
+        }
+
+        if (ch === '/' && source[index + 1] === '*') {
+          index += 2;
+          while (index < length && !(source[index] === '*' && source[index + 1] === '/')) index += 1;
+          index = Math.min(length, index + 2);
+          bump('comment');
+          continue;
+        }
+
+        if (ch === '"' || ch === '\'' || ch === '\u201c' || ch === '\u2018') {
+          const smart = ch === '\u201c' || ch === '\u2018';
+          const single = ch === '\'' || ch === '\u2018';
+          const closers = single
+            ? (smart ? ['\u2019', '\''] : ['\''])
+            : (smart ? ['\u201d', '"'] : ['"']);
+          let body = '';
+          let cursor = index + 1;
+          while (cursor < length) {
+            const current = source[cursor];
+            if (current === '\\') {
+              const next = source[cursor + 1];
+              if (next === undefined) {
+                body += '\\\\';
+                cursor += 1;
+                break;
+              }
+              if (next === '\'' || next === '\u2019') body += '\'';
+              else if (next === '\u201c' || next === '\u201d' || next === '\u2018') body += next;
+              else body += '\\' + next;
+              cursor += 2;
+              continue;
+            }
+            if (closers.indexOf(current) !== -1) {
+              cursor += 1;
+              break;
+            }
+            if (current === '"') body += '\\"';
+            else body += current;
+            cursor += 1;
+          }
+          if (smart) bump('smartQuote');
+          else if (single) bump('singleQuote');
+          out += '"' + body + '"';
+          index = cursor;
+          continue;
+        }
+
+        const mapped = FULL_WIDTH_CHARS[ch];
+        if (mapped !== undefined) {
+          if (mapped === '}' || mapped === ']') closeBracket(mapped);
+          else out += mapped;
+          bump('fullWidth');
+          index += 1;
+          continue;
+        }
+
+        if (ch === '-' && source.slice(index + 1, index + 9) === 'Infinity') {
+          out += 'null';
+          bump('literal');
+          index += 9;
+          continue;
+        }
+
+        if (isWordStart(source.charCodeAt(index))) {
+          let cursor = index + 1;
+          while (cursor < length && isWordPart(source.charCodeAt(cursor))) cursor += 1;
+          const word = source.slice(index, cursor);
+          let look = cursor;
+          while (look < length && isSpacing(source[look])) look += 1;
+          if (source[look] === ':') {
+            out += '"' + word + '"';
+            bump('unquotedKey');
+          } else if (word === 'True' || word === 'False' || word === 'None' || word === 'NaN' || word === 'Infinity' || word === 'undefined') {
+            out += word === 'True' ? 'true' : word === 'False' ? 'false' : 'null';
+            bump('literal');
+          } else {
+            out += word;
+          }
+          index = cursor;
+          continue;
+        }
+
+        out += ch;
+        index += 1;
+      }
+
+      return out;
+    }
+
+    function repairJson(input) {
+      const counts = {};
+      const bump = (id) => {
+        counts[id] = (counts[id] || 0) + 1;
+      };
+      let source = input;
+      if (source.charCodeAt(0) === 0xfeff) {
+        source = source.slice(1);
+        bump('bom');
+      }
+      const text = scanJsonish(source, bump);
+      let total = 0;
+      for (const key of Object.keys(counts)) total += counts[key];
+      const parsed = parseJson(text.trim());
+      return { text, counts, total, parsed };
+    }
+
+    function analyzeJson(value) {
+      const stats = { objects: 0, arrays: 0, scalars: 0, depth: 0 };
+      const stack = [{ value, depth: 1 }];
+      while (stack.length > 0) {
+        const entry = stack.pop();
+        if (entry.depth > stats.depth) stats.depth = entry.depth;
+        const current = entry.value;
+        if (current === null) {
+          stats.scalars += 1;
+          continue;
+        }
+        if (typeof current !== 'object') {
+          stats.scalars += 1;
+          continue;
+        }
+        if (Array.isArray(current)) {
+          stats.arrays += 1;
+          for (let item = 0; item < current.length; item += 1) {
+            stack.push({ value: current[item], depth: entry.depth + 1 });
+          }
+          continue;
+        }
+        stats.objects += 1;
+        const keys = Object.keys(current);
+        for (let item = 0; item < keys.length; item += 1) {
+          stack.push({ value: current[keys[item]], depth: entry.depth + 1 });
+        }
+      }
+      return stats;
+    }
     // --- end pure helpers ---
 
     const zh = {
       title: 'JSON 工具',
-      subtitle: '格式化或压缩 JSON 文本。粘贴、转换、复制，全部在本机完成。',
+      subtitle: '格式化或压缩 JSON 文本，校验语法并自动纠正常见错误。全部在本机完成。',
       inputLabel: '输入',
       outputLabel: '输出',
       inputPlaceholder: '在此粘贴 JSON 文本，例如 {"name":"dsh","tags":["json","tools"]}',
@@ -83,11 +286,32 @@ window.__ModuleLoader__.load({
       charsLines: '{chars} 字符 · {lines} 行',
       shortcut: 'Ctrl/⌘ + Enter 格式化',
       localNote: '文本只在浏览器内处理，不会上传。',
+      validate: '校验',
+      repair: '纠错',
+      reportValidation: '校验报告',
+      reportRepair: '纠错报告',
+      validJson: 'JSON 语法合法',
+      invalidJson: 'JSON 语法不合法',
+      depthLine: '最大嵌套深度：{depth}',
+      countsLine: '对象 {objects} · 数组 {arrays} · 标量 {scalars}',
+      fixTotal: '已修复 {total} 处问题',
+      fixSuggest: '检测到 {total} 处可自动修复的问题，可点「纠错」修复。',
+      noFixFound: '未检测到可自动修复的问题，请手动修正。',
+      alreadyValid: 'JSON 已合法，无需修复。',
+      repairStillInvalid: '修复后仍不合法，请按提示继续修改。',
+      issueTrailingComma: '尾逗号',
+      issueSingleQuote: '单引号',
+      issueSmartQuote: '弯引号',
+      issueComment: '注释',
+      issueUnquotedKey: '未加引号的键',
+      issueLiteral: '非 JSON 字面量',
+      issueFullWidth: '全角标点',
+      issueBom: 'BOM',
     };
 
     const en = {
       title: 'JSON tools',
-      subtitle: 'Format or minify JSON text. Paste, convert, copy — all on this device.',
+      subtitle: 'Format or minify JSON text, validate the syntax and auto-fix common mistakes. All on this device.',
       inputLabel: 'Input',
       outputLabel: 'Output',
       inputPlaceholder: 'Paste JSON here, for example {"name":"dsh","tags":["json","tools"]}',
@@ -118,6 +342,27 @@ window.__ModuleLoader__.load({
       charsLines: '{chars} characters · {lines} lines',
       shortcut: 'Ctrl/⌘ + Enter to format',
       localNote: 'Text is processed in the browser only and never uploaded.',
+      validate: 'Validate',
+      repair: 'Fix',
+      reportValidation: 'Validation report',
+      reportRepair: 'Repair report',
+      validJson: 'Valid JSON',
+      invalidJson: 'Invalid JSON',
+      depthLine: 'Maximum nesting depth: {depth}',
+      countsLine: 'Objects {objects} · arrays {arrays} · scalars {scalars}',
+      fixTotal: 'Fixed {total} issue(s)',
+      fixSuggest: '{total} auto-fixable issue(s) found — use Fix.',
+      noFixFound: 'No auto-fixable issue found; edit the text manually.',
+      alreadyValid: 'The JSON is already valid; nothing to fix.',
+      repairStillInvalid: 'Still invalid after repair; fix the remaining problem manually.',
+      issueTrailingComma: 'trailing comma',
+      issueSingleQuote: 'single quotes',
+      issueSmartQuote: 'curly quotes',
+      issueComment: 'comments',
+      issueUnquotedKey: 'bare keys',
+      issueLiteral: 'non-JSON literals',
+      issueFullWidth: 'full-width punctuation',
+      issueBom: 'BOM',
     };
 
     function JsonGlyph({ size = 22 }) {
@@ -380,17 +625,16 @@ window.__ModuleLoader__.load({
   border-color: var(--dsw-alias-brand-primary);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--dsw-alias-brand-primary) 22%, transparent);
 }
-.dsh-jt-status {
+.dsh-jt-notice {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
+  gap: 9px;
   min-height: 20px;
   font-size: 12.5px;
   line-height: 1.5;
   color: var(--dsw-alias-label-secondary);
 }
-.dsh-jt-status::before {
-  content: '';
+.dsh-jt-notice-dot {
   flex: none;
   width: 7px;
   height: 7px;
@@ -398,27 +642,45 @@ window.__ModuleLoader__.load({
   border-radius: 50%;
   background: var(--dsw-alias-state-idle-primary);
 }
-.dsh-jt-status.is-ok {
+.dsh-jt-notice.is-ok {
   color: var(--dsw-alias-state-success-primary);
 }
-.dsh-jt-status.is-ok::before {
+.dsh-jt-notice.is-ok .dsh-jt-notice-dot {
   background: var(--dsw-alias-state-success-primary);
 }
-.dsh-jt-status.is-error {
+.dsh-jt-notice.is-error {
   color: var(--dsw-alias-state-error-primary);
 }
-.dsh-jt-status.is-error::before {
+.dsh-jt-notice.is-error .dsh-jt-notice-dot {
   background: var(--dsw-alias-state-error-primary);
 }
-.dsh-jt-status-text {
+.dsh-jt-notice-body {
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
-.dsh-jt-detail {
+.dsh-jt-notice-title {
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+.dsh-jt-notice.is-ok .dsh-jt-notice-title {
+  color: var(--dsw-alias-state-success-primary);
+}
+.dsh-jt-notice.is-error .dsh-jt-notice-title {
+  color: var(--dsw-alias-state-error-primary);
+}
+.dsh-jt-notice-line {
+  margin: 0;
+  color: inherit;
+}
+.dsh-jt-notice-detail {
   display: block;
-  margin-top: 3px;
+  margin-top: 1px;
   color: var(--dsw-alias-label-secondary);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11.5px;
+  white-space: pre-wrap;
   word-break: break-word;
 }
 .dsh-jt-foot {
@@ -467,7 +729,7 @@ window.__ModuleLoader__.load({
       const [text, setText] = React.useState('');
       const [output, setOutput] = React.useState('');
       const [indent, setIndent] = React.useState(2);
-      const [status, setStatus] = React.useState({ kind: 'idle', message: null, detail: null });
+      const [notice, setNotice] = React.useState({ kind: 'idle', title: null, lines: [], detail: null });
       const [copied, setCopied] = React.useState(false);
       const inputRef = React.useRef(null);
 
@@ -487,23 +749,25 @@ window.__ModuleLoader__.load({
         return '';
       };
 
+      const setMessage = (kind, lines, detail = null, title = null) => {
+        setNotice({ kind, title, lines, detail });
+      };
+
       const run = (mode) => {
         const raw = text.trim();
         if (raw === '') {
           setOutput('');
-          setStatus({ kind: 'idle', message: t('emptyHint'), detail: null });
+          setMessage('idle', [t('emptyHint')]);
           return;
         }
         const parsed = parseJson(raw);
         if (!parsed.ok) {
           setOutput('');
-          setStatus({
-            kind: 'error',
-            message: parsed.at === null
-              ? t('errorTitle')
-              : t('errorTitle') + ' · ' + t('errorAt', parsed.at),
-            detail: parsed.message,
-          });
+          setMessage(
+            'error',
+            [parsed.at === null ? t('errorTitle') : t('errorTitle') + ' · ' + t('errorAt', parsed.at)],
+            parsed.message,
+          );
           return;
         }
         const next = stringifyJson(parsed.value, mode === 'minify' ? 0 : indent);
@@ -512,21 +776,82 @@ window.__ModuleLoader__.load({
         if (delta > 0) deltaText = t('deltaUp', { percent: delta });
         else if (delta < 0) deltaText = t('deltaDown', { percent: Math.abs(delta) });
         setOutput(next);
-        setStatus({
-          kind: 'ok',
-          message: t('done', {
-            input: formatCount(raw.length),
-            output: formatCount(next.length),
-            delta: deltaText,
-          }) + ' \u00b7 ' + describe(parsed.value),
-          detail: null,
-        });
+        setMessage('ok', [t('done', {
+          input: formatCount(raw.length),
+          output: formatCount(next.length),
+          delta: deltaText,
+        }) + ' \u00b7 ' + describe(parsed.value)]);
+      };
+
+      const fixItems = (counts) => {
+        const parts = [];
+        for (const id of FIX_ORDER) {
+          const count = counts[id];
+          if (!count) continue;
+          parts.push(t(FIX_LABELS[id]) + ' ×' + formatCount(count));
+        }
+        return parts.join(' · ');
+      };
+
+      const validate = () => {
+        const raw = text.trim();
+        if (raw === '') {
+          setMessage('idle', [t('emptyHint')]);
+          return;
+        }
+        const parsed = parseJson(raw);
+        if (parsed.ok) {
+          const stats = analyzeJson(parsed.value);
+          setMessage('ok', [
+            t('validJson'),
+            describe(parsed.value),
+            t('depthLine', { depth: stats.depth }),
+            t('countsLine', {
+              objects: formatCount(stats.objects),
+              arrays: formatCount(stats.arrays),
+              scalars: formatCount(stats.scalars),
+            }),
+          ], null, t('reportValidation'));
+          return;
+        }
+        const analysis = repairJson(raw);
+        const lines = [t('invalidJson') + (parsed.at === null ? '' : ' · ' + t('errorAt', parsed.at))];
+        lines.push(analysis.total > 0 && analysis.parsed.ok
+          ? t('fixSuggest', { total: formatCount(analysis.total) })
+          : t('noFixFound'));
+        setMessage('error', lines, parsed.message, t('reportValidation'));
+      };
+
+      const repair = () => {
+        const raw = text.trim();
+        if (raw === '') {
+          setMessage('idle', [t('emptyHint')]);
+          return;
+        }
+        const result = repairJson(raw);
+        if (result.total === 0) {
+          if (result.parsed.ok) {
+            setMessage('ok', [t('alreadyValid')], null, t('reportRepair'));
+          } else {
+            setMessage('error', [t('noFixFound')], result.parsed.message, t('reportRepair'));
+          }
+          return;
+        }
+        setOutput(result.text.trim());
+        const lines = [t('fixTotal', { total: formatCount(result.total) }), fixItems(result.counts)];
+        if (result.parsed.ok) {
+          lines.push(describe(result.parsed.value));
+          setMessage('ok', lines, null, t('reportRepair'));
+        } else {
+          lines.push(t('repairStillInvalid'));
+          setMessage('error', lines, result.parsed.message, t('reportRepair'));
+        }
       };
 
       const clearAll = () => {
         setText('');
         setOutput('');
-        setStatus({ kind: 'idle', message: null, detail: null });
+        setNotice({ kind: 'idle', title: null, lines: [], detail: null });
         if (inputRef.current !== null) inputRef.current.focus();
       };
 
@@ -534,7 +859,7 @@ window.__ModuleLoader__.load({
         if (output === '') return;
         setText(output);
         setOutput('');
-        setStatus({ kind: 'idle', message: null, detail: null });
+        setNotice({ kind: 'idle', title: null, lines: [], detail: null });
         if (inputRef.current !== null) inputRef.current.focus();
       };
 
@@ -542,18 +867,20 @@ window.__ModuleLoader__.load({
         if (output === '') return;
         const clipboard = navigator.clipboard;
         if (clipboard === undefined || typeof clipboard.writeText !== 'function') {
-          setStatus({ kind: 'error', message: t('copyFailed'), detail: null });
+          setMessage('error', [t('copyFailed')]);
           return;
         }
         clipboard.writeText(output).then(
           () => setCopied(true),
-          () => setStatus({ kind: 'error', message: t('copyFailed'), detail: null }),
+          () => setMessage('error', [t('copyFailed')]),
         );
       };
 
       const onInputChange = (event) => {
         setText(event.target.value);
-        if (status.kind !== 'idle') setStatus({ kind: 'idle', message: null, detail: null });
+        if (notice.kind !== 'idle' || notice.lines.length > 0) {
+          setNotice({ kind: 'idle', title: null, lines: [], detail: null });
+        }
         if (copied) setCopied(false);
       };
 
@@ -573,9 +900,9 @@ window.__ModuleLoader__.load({
         lines: formatCount(lineCount(output)),
       });
 
-      let statusClass = 'dsh-jt-status';
-      if (status.kind === 'ok') statusClass += ' is-ok';
-      else if (status.kind === 'error') statusClass += ' is-error';
+      let noticeClass = 'dsh-jt-notice';
+      if (notice.kind === 'ok') noticeClass += ' is-ok';
+      else if (notice.kind === 'error') noticeClass += ' is-error';
 
       return h('div', { className: 'dsh-jt-root' },
         h('style', null, CSS),
@@ -599,6 +926,16 @@ window.__ModuleLoader__.load({
                 className: 'dsh-jt-btn',
                 onClick: () => run('minify'),
               }, t('minify')),
+              h('button', {
+                type: 'button',
+                className: 'dsh-jt-btn',
+                onClick: repair,
+              }, t('repair')),
+              h('button', {
+                type: 'button',
+                className: 'dsh-jt-btn',
+                onClick: validate,
+              }, t('validate')),
               h('div', {
                 className: 'dsh-jt-seg',
                 role: 'group',
@@ -666,10 +1003,12 @@ window.__ModuleLoader__.load({
                   wrap: 'off',
                   'aria-label': t('outputLabel'),
                 }))),
-            h('div', { className: statusClass, role: 'status', 'aria-live': 'polite' },
-              h('span', { className: 'dsh-jt-status-text' },
-                status.message === null ? '' : status.message,
-                status.detail === null ? null : h('span', { className: 'dsh-jt-detail' }, status.detail)))),
+            h('div', { className: noticeClass, role: 'status', 'aria-live': 'polite' },
+              h('span', { className: 'dsh-jt-notice-dot', 'aria-hidden': true }),
+              h('div', { className: 'dsh-jt-notice-body' },
+                notice.title === null ? null : h('div', { className: 'dsh-jt-notice-title' }, notice.title),
+                notice.lines.map((line, index) => h('p', { key: index, className: 'dsh-jt-notice-line' }, line)),
+                notice.detail === null ? null : h('code', { className: 'dsh-jt-notice-detail' }, notice.detail)))),
           h('footer', { className: 'dsh-jt-foot' },
             h('span', null, t('localNote')))));
     }

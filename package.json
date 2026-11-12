@@ -1,9 +1,9 @@
 {
   "name": "@local/json-tools",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Format or minify JSON text in a full-page panel with indent choice, error location and one-click copy.",
+  "description": "Format, minify, validate and auto-fix JSON text in a full-page panel with indent choice, error locations and one-click copy.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
